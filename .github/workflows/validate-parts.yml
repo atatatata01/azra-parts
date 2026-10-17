@@ -18,7 +18,7 @@ env:
   # Pinned validator build (release asset of THIS repo). Owner steps: docs/tools/AZRA_PARTS.md.
   VALIDATOR_TAG: validator-v1
   VALIDATOR_ASSET: azra-part-check-linux-x86_64
-  VALIDATOR_SHA256: "REPLACE_WITH_SHA256_OF_THE_UPLOADED_ASSET"
+  VALIDATOR_SHA256: "d26b0d4863c6c446122729a61db4e459b97c6a3c0bc6e7e41889d7ccca3d3e4c"
 
 jobs:
   validate:
