@@ -1,0 +1,118 @@
+# Re-validates every pull request with AZRA's own part loader (azra-part-check, headless Linux)
+# and comments the result. The owner merges; merging publishes the part to every AZRA.
+#
+# Safety: `pull_request` (not `pull_request_target`) — PR content is DATA here; the only code
+# that runs is the pinned validator binary below (checked against its SHA-256) and the scripts
+# from the BASE branch. Nothing from the PR is executed.
+name: Validate parts
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # Pinned validator build (release asset of THIS repo). Owner steps: docs/tools/AZRA_PARTS.md.
+  VALIDATOR_TAG: validator-v1
+  VALIDATOR_ASSET: azra-part-check-linux-x86_64
+  VALIDATOR_SHA256: "REPLACE_WITH_SHA256_OF_THE_UPLOADED_ASSET"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR (data only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: pr
+
+      - name: Checkout base scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          path: base
+
+      - name: Fetch pinned validator
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          gh release download "$VALIDATOR_TAG" -R "$GITHUB_REPOSITORY" -p "$VALIDATOR_ASSET" -D "$RUNNER_TEMP/bin"
+          echo "$VALIDATOR_SHA256  $RUNNER_TEMP/bin/$VALIDATOR_ASSET" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/$VALIDATOR_ASSET"
+
+      - name: Validate
+        id: check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          V="$RUNNER_TEMP/bin/$VALIDATOR_ASSET"
+          OUT="$RUNNER_TEMP/summary.md"
+          status=0
+          cd pr
+          changed="$(git diff --name-status "$BASE_SHA" "$HEAD_SHA")"
+          {
+            echo "### AZRA part validation"
+            echo
+          } > "$OUT"
+          # 1. Only ADDITIONS under parts/ — edits, deletions or other files need the owner's eye.
+          other="$(printf '%s\n' "$changed" | awk '$1 != "A" || $2 !~ /^parts\// {print}' | sed '/^$/d')"
+          if [ -n "$other" ]; then
+            status=1
+            { echo "**Needs owner review:** this PR changes more than new files under \`parts/\`:"; echo '```'; printf '%s\n' "$other"; echo '```'; } >> "$OUT"
+          fi
+          # 2. Repository layout: the BASE branch's script over the PR's parts/ (build_index.py
+          #    resolves paths relative to its own repo root, so it runs from a scratch copy).
+          rm -rf "$RUNNER_TEMP/layout" && mkdir -p "$RUNNER_TEMP/layout/scripts"
+          cp ../base/scripts/build_index.py "$RUNNER_TEMP/layout/scripts/"
+          cp -r parts "$RUNNER_TEMP/layout/parts"
+          if layout="$(python3 "$RUNNER_TEMP/layout/scripts/build_index.py" --layout 2>&1)"; then
+            echo "- Layout: OK" >> "$OUT"
+          else
+            status=1
+            { echo "- Layout: **FAILED**"; echo '```'; printf '%s\n' "$layout"; echo '```'; } >> "$OUT"
+          fi
+          # 3. Every package folder touched by the PR, through AZRA's own loader.
+          dirs="$(printf '%s\n' "$changed" | awk '$2 ~ /^parts\/[^/]+\/[^/]+\// {split($2,a,"/"); print a[1]"/"a[2]"/"a[3]}' | sort -u)"
+          for d in $dirs; do
+            [ -d "$d" ] || continue
+            if r="$(ulimit -v 2097152; timeout 60 "$V" "$d" 2>/dev/null)"; then
+              echo "- \`$d\`: **valid**" >> "$OUT"
+            else
+              status=1
+              err="$(printf '%s' "$r" | python3 -c 'import sys,json
+          try: print(json.loads(sys.stdin.read().splitlines()[-1]).get("error","validator failed"))
+          except Exception: print("validator crashed or timed out")')"
+              echo "- \`$d\`: **refused** — $err" >> "$OUT"
+            fi
+          done
+          [ -z "$dirs" ] && echo "- No part packages in this PR." >> "$OUT"
+          echo >> "$OUT"
+          if [ "$status" = 0 ]; then
+            echo "All checks passed. License: CC0-1.0. Merge = publish to every AZRA." >> "$OUT"
+          else
+            echo "Do **not** merge until the items above are resolved." >> "$OUT"
+          fi
+          cat "$OUT"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        # Fork PRs get a read-only token: the comment then fails, the job status still reports.
+        run: gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/summary.md" || true
+
+      - name: Fail the check when refused
+        if: steps.check.outputs.status != '0'
+        run: exit 1
